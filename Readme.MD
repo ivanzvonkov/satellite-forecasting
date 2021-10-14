@@ -1,5 +1,8 @@
-# Diverse Video Generation
-This is code for the paper [Diverse Video Generation using a Gaussian Process Trigger](https://openreview.net/forum?id=Qm7R_SdqTpT) by [Gaurav Shrivastava](https://www.cs.umd.edu/~gauravsh/) and [Abhinav Shrivastava](https://www.cs.umd.edu/~abhinav/). 
+# Satellite Forecasting
+
+This repository is based on the Diverse Video Generation repo.
+
+The code for that paper is [Diverse Video Generation using a Gaussian Process Trigger](https://openreview.net/forum?id=Qm7R_SdqTpT) by [Gaurav Shrivastava](https://www.cs.umd.edu/~gauravsh/) and [Abhinav Shrivastava](https://www.cs.umd.edu/~abhinav/). 
 
 ## Environment
 1. Ensure you have [anaconda](https://www.anaconda.com/download/) installed and run:
