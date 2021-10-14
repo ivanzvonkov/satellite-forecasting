@@ -1,6 +1,6 @@
 import warnings
 
-from data.satellite import RGB_BANDS
+from data.satellite import RGB_BANDS, Normalization
 warnings.simplefilter("ignore", UserWarning)
 
 import torch
@@ -8,6 +8,7 @@ import torch.nn as nn
 import argparse
 import random
 from torch.utils.data import DataLoader
+import json
 import utils
 import progressbar, pdb
 import numpy as np
@@ -53,8 +54,9 @@ parser.add_argument('--model_path', type=str, default='', help='model pth file w
 parser.add_argument('--home_dir', type=str, default='.', help='Where to save gifs, models, etc')
 parser.add_argument('--test', type=bool, default=False, help="whether to train or test the model")
 parser.add_argument('--run_name', type=str, default='', help='name of run')
-parser.add_argument('--encoder_only', type=bool, default=False, help='whether to train only encoder')
-parser.add_argument('--loss', default="mse", help='loss function to use (mse | l1 | ssim)')
+parser.add_argument('--loss', default="mse", help='loss function to use (mse | l1 | ssim | ssim_mse_point1 | ssim_mse_point01 | ssim_l1_point1 | ssim_l1_point01 )')
+parser.add_argument('--normalization', type=str, default="z", help='normalization to use (z | minmax | skip | clip5_minmax | clip4_minmax | clip3_minmax)')
+parser.add_argument('--components', type=str, default="all", help='components to train (encoder | encoder_lstm | all)')
 
 opt = parser.parse_args()
 print("Random Seed: ", opt.seed)
@@ -68,33 +70,9 @@ home_dir = Path(opt.home_dir)
 torch.cuda.manual_seed_all(opt.seed)
 dtype = torch.cuda.FloatTensor
 
-# --------- load a dataset ------------------------------------
-train_data, test_data = utils.load_dataset(opt, bands_to_keep=RGB_BANDS)
-
-num_workers = opt.data_threads
-if opt.dataset == "satellite":
-    print("Satellite dataset only works with num_workers=1")
-    num_workers = 1
-
-train_loader = DataLoader(train_data,
-                          num_workers=num_workers,
-                          batch_size=opt.batch_size,
-                          shuffle=True,
-                          drop_last=True,
-                          pin_memory=True)
-test_loader = DataLoader(test_data,
-                         num_workers=num_workers,
-                         batch_size=opt.batch_size,
-                         shuffle=True,
-                         drop_last=True,
-                         pin_memory=True)
-
 # ---------------- load the models  ----------------
-
 print(opt)
 
-dataset = opt.dataset
-encoder_only = opt.encoder_only
 lr = opt.lr
 loss_type = opt.loss
 
@@ -128,10 +106,40 @@ else:
     decoder = model['decoder']
     frame_predictor = model['frame_predictor']
 
+    opt_dict = vars(model['opt'])
+    for opt_key in ["data_root", "dataset", "n_past", "n_future", "n_eval", "image_width", "channels", "components", "normalization"]:
+        if opt_key in opt_dict:
+            setattr(opt, opt_key, opt_dict[opt_key])
+
+assert opt.components in ["encoder", "encoder_lstm", "all"]
+encoder_only = opt.components == "encoder"
+encoder_lstm_only = opt.components == "encoder_lstm"
+
 # ---------------- models tranferred to GPU ----------------
 encoder.cuda()
 decoder.cuda()
 frame_predictor.cuda()
+
+# --------- load a dataset ------------------------------------
+train_data, test_data = utils.load_dataset(opt, bands_to_keep=RGB_BANDS, normalization=Normalization(opt.normalization))
+
+num_workers = opt.data_threads
+if opt.dataset == "satellite":
+    print("Satellite dataset only works with num_workers=1")
+    num_workers = 1
+
+train_loader = DataLoader(train_data,
+                          num_workers=num_workers,
+                          batch_size=opt.batch_size,
+                          shuffle=True,
+                          drop_last=True,
+                          pin_memory=True)
+test_loader = DataLoader(test_data,
+                         num_workers=num_workers,
+                         batch_size=opt.batch_size,
+                         shuffle=True,
+                         drop_last=True,
+                         pin_memory=True)
 
 
 # ---------------- optimizers ----------------
@@ -158,31 +166,42 @@ scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[3, 5], g
 mll = gpytorch.mlls.VariationalELBO(likelihood, gp_layer, num_data=opt.batch_size, combine_terms=True)
 
 # --------- loss functions ------------------------------------
+
+ssim = SSIM().cuda()
+mse = nn.MSELoss().cuda()
+l1 = nn.L1Loss().cuda()
+
 if loss_type == "ssim":
-    ssim = SSIM().cuda()
-    loss_func = lambda pred, gt: 1 - ssim(pred, gt)
-    latent_loss_func = SSIM().cuda()
+    reconstruction_loss_func = lambda pred, gt: 1 - ssim(pred, gt)
 elif loss_type == "l1":
-    loss_func = nn.L1Loss().cuda()
+    reconstruction_loss_func = l1
 elif loss_type == "mse":
-    loss_func = nn.MSELoss().cuda()
-elif loss_type.startswith("ssim_mse_point"):
-    ssim = SSIM().cuda()
-    mse = nn.MSELoss().cuda()
+    reconstruction_loss_func = mse
+elif loss_type.startswith("ssim_mse"):
     if loss_type.endswith("point01"):
         mse_weight = 0.01
     elif loss_type.endswith("point1"):
         mse_weight = 0.1
     elif loss_type.endswith("point001"):
         mse_weight = 0.001
-    loss_func = lambda pred, gt:  mse_weight*mse(pred, gt) + 1 - ssim(pred, gt)
+    else:
+        mse_weight = 1
+    reconstruction_loss_func = lambda pred, gt:  mse_weight*mse(pred, gt) + 1 - ssim(pred, gt)
+elif loss_type.startswith("ssim_l1"):
+    if loss_type.endswith("point01"):
+        l1_weight = 0.01
+    elif loss_type.endswith("point1"):
+        l1_weight = 0.1
+    elif loss_type.endswith("point001"):
+        l1_weight = 0.001
+    else:
+        l1_weight = 1
+    reconstruction_loss_func = lambda pred, gt:  l1_weight*l1(pred, gt) + 1 - ssim(pred, gt)
 
 else:
     raise ValueError(f"Loss type {loss_type} not recognized")
 
 latent_loss_func = nn.MSELoss()
-
-#loss_func.cuda()
 latent_loss_func.cuda()
 
 def get_training_batch():
@@ -215,17 +234,12 @@ def train(x, global_step, tb_writer):
 
             decoded = decoder([h_pred, skip])
             assert x[i].shape == decoded.shape
-            ae_loss += loss_func(decoded, x[i])
+            ae_loss += reconstruction_loss_func(decoded, x[i])
             torch.cuda.empty_cache()
         
         ae_loss.backward()
-        
-        if loss_type == "l1":
-            tb_writer.add_scalar(f"Step Loss/Encoder l1", ae_loss, global_step)
-        elif loss_type == "ssim":
-            tb_writer.add_scalar(f"Step Loss/Encoder ssim", ae_loss, global_step)
-        else:
-            tb_writer.add_scalar(f"Step Loss/Encoder {loss_type}", ae_loss, global_step)
+
+        tb_writer.add_scalar(f"Step Loss/Encoder {loss_type}", ae_loss, global_step)
 
         encoder_optimizer.step()
         decoder_optimizer.step()
@@ -258,29 +272,36 @@ def train(x, global_step, tb_writer):
             h_pred = frame_predictor(h)                         # Target encoding using LSTM
             latent_loss  += latent_loss_func(h_pred,h_target) # LSTM loss - how well LSTM predicts next encoding
 
-            gp_pred = gp_layer(h.transpose(0,1).view(90,opt.batch_size,1))#likelihood(gp_layer(h.transpose(0,1).view(90,opt.batch_size,1)))#
-            max_ll -= mll(gp_pred,h_target.transpose(0,1))      # GP Loss - how well GP predicts next encoding
+            if not encoder_lstm_only:
+                gp_pred = gp_layer(h.transpose(0,1).view(90,opt.batch_size,1))#likelihood(gp_layer(h.transpose(0,1).view(90,opt.batch_size,1)))#
+                max_ll -= mll(gp_pred,h_target.transpose(0,1))      # GP Loss - how well GP predicts next encoding
             x_pred = decoder([h_pred, skip])                    # Decoded LSTM prediction
 
             x_target_pred = decoder([h_target, skip])           # Decoded target encoding
-            ae_loss += latent_loss_func(x_target_pred,x[i])  # Encoder loss - how well the encoder encodes
+            ae_loss += reconstruction_loss_func(x_target_pred,x[i])  # Encoder loss - how well the encoder encodes
 
-            x_pred_gp = decoder([gp_pred.mean.transpose(0,1), skip])    # Decoded GP prediction
-            lstm_loss += loss_func(x_pred, x[i])                          # Encoder + LSTM loss - how well the encoder+LSTM predicts the next frame
-            gp_loss += latent_loss_func(x_pred_gp, x[i])             # Encoder + GP loss - how well the encoder+GP predicts the next frame
+            if not encoder_lstm_only:
+                x_pred_gp = decoder([gp_pred.mean.transpose(0,1), skip])    # Decoded GP prediction
+            lstm_loss += reconstruction_loss_func(x_pred, x[i])                          # Encoder + LSTM loss - how well the encoder+LSTM predicts the next frame
+            if not encoder_lstm_only:
+                gp_loss += reconstruction_loss_func(x_pred_gp, x[i])             # Encoder + GP loss - how well the encoder+GP predicts the next frame
             torch.cuda.empty_cache()
 
 
         encoder_weight = 100
         alpha = 1
         beta = 0.1
-        loss = encoder_weight*ae_loss + alpha*lstm_loss+ alpha*latent_loss  + beta*gp_loss + beta*max_ll.sum()  # + kld*opt.beta
+        loss = encoder_weight*ae_loss + alpha*lstm_loss+ alpha*latent_loss  # + kld*opt.beta
+        if not encoder_lstm_only:
+            loss += beta*gp_loss + beta*max_ll.sum()
 
-        tb_writer.add_scalar("Step Loss/Encoder", ae_loss, global_step)
+        tb_writer.add_scalar(f"Step Loss/Encoder {loss_type}", ae_loss, global_step)
         tb_writer.add_scalar("Step Loss/Encoder and LSTM", lstm_loss, global_step)
         tb_writer.add_scalar("Step Loss/LSTM", latent_loss , global_step)
-        tb_writer.add_scalar("Step Loss/Encoder and GP loss", gp_loss, global_step)
-        tb_writer.add_scalar("Step Loss/GP loss", max_ll.sum(), global_step)
+
+        if not encoder_lstm_only:
+            tb_writer.add_scalar("Step Loss/Encoder and GP loss", gp_loss, global_step)
+            tb_writer.add_scalar("Step Loss/GP loss", max_ll.sum(), global_step)
         tb_writer.add_scalar("Step Loss/Total", loss, global_step)
 
         loss.backward()
@@ -311,7 +332,7 @@ def predict(x, interval_for_gp_layer: int = 10) -> List[torch.Tensor]:
         
         # Use the GP layer to predict the next time step
         # Previously i%10 was used for longer sequences
-        if i % interval_for_gp_layer == 0: 
+        if not encoder_lstm_only and i % interval_for_gp_layer == 0: 
             h_pred_from_gp_layer = likelihood(gp_layer(h.transpose(0,1).view(90,opt.batch_size,1)))
             h_pred = h_pred_from_gp_layer.rsample().transpose(0,1)
         
@@ -350,6 +371,8 @@ def plot(x, epoch):
 
     if encoder_only:
         gen_seq = [predict_decoding(x)]
+    elif encoder_lstm_only:
+        gen_seq = [predict(x)]
     else:
         gen_seq = [predict(x) for _ in range(nsample)]
 
@@ -363,7 +386,7 @@ def plot(x, epoch):
         row = [gt_seq[t][i] for t in range(opt.n_eval)] 
         to_plot.append(row)
 
-        if encoder_only:
+        if encoder_only or encoder_lstm_only:
             s_list = [0]
         else:
             # Finds best sequence (lowest loss)
@@ -418,20 +441,50 @@ def plot(x, epoch):
     if encoder_only:
         file_name += "_autoencoders"
 
-    img_path = home_dir / f'imgs/{dataset}/{file_name}.png'
+    img_path = home_dir / f'imgs/{opt.dataset}/{file_name}.png'
     img_path.parent.mkdir(parents=True, exist_ok=True)
     tensor_of_images = utils.save_tensors_image(str(img_path), to_plot)
     print(f"Saving image to: {img_path}")
 
-    gif_path = home_dir / f'gifs/{dataset}/{file_name}.gif'
+    gif_path = home_dir / f'gifs/{opt.dataset}/{file_name}.gif'
     gif_path.parent.mkdir(parents=True, exist_ok=True)
     utils.save_gif(str(gif_path), gifs)
     print(f"Saving images as gif: {gif_path}")
     
 
 # --------- testing loop ------------------------------------
-def compute_mse(Y_pred: List[np.ndarray], Y_true: List[np.ndarray]) -> np.ndarray:
-    return ((np.array(Y_true) - np.array(Y_pred))**2).mean(axis=(0,-2,-1))
+def compute_metrics(Y_pred: List[np.ndarray], Y_true: List[np.ndarray]) -> np.ndarray:
+    metric_per_timestep = {
+        "mse": [],
+        "l1": [],
+        "ssim": [],
+    }
+    with torch.no_grad():
+        Y_pred_tensor = torch.tensor(Y_pred)
+        Y_true_tensor = torch.tensor(Y_true)
+        for i in range(len(Y_pred)):
+            y_true = torch.unsqueeze(Y_true_tensor[i], 0)
+            y_pred = torch.unsqueeze(Y_pred_tensor[i], 0)
+            
+            assert y_true.shape == (1, 3, opt.image_width, opt.image_width)
+            assert y_true.shape == y_pred.shape
+
+            mse_for_timestep = mse(y_true, y_pred).item()
+            metric_per_timestep["mse"].append(mse_for_timestep)
+            assert np.isclose(mse_for_timestep, ((Y_true[i] - Y_pred[i])**2).mean()), f"{mse_for_timestep} and {((Y_true[i] - Y_pred[i])**2).mean()}"
+            
+            l1_for_timestep = l1(y_true, y_pred).item()
+            metric_per_timestep["l1"].append(l1_for_timestep)
+            assert np.isclose(l1_for_timestep, (np.abs(Y_true[i] - Y_pred[i])).mean()), f"{l1_for_timestep} and {np.abs(Y_true[i] - Y_pred[i]).mean()}"
+
+            metric_per_timestep["ssim"].append(ssim(y_true, y_pred).item())
+
+    metric_for_example = {}
+    for metric_type, metric_values in metric_per_timestep.items():
+        assert len(metric_values) == len(Y_pred), f"{metric_type} does not have enough values"
+        metric_for_example[metric_type] = np.mean(metric_values)
+
+    return metric_for_example
 
 if opt.test:
     frame_predictor.eval()
@@ -439,13 +492,21 @@ if opt.test:
     likelihood.eval()
 
     # Go through all test data
-    normalized_mse_list = []
-    unnormalized_mse_list = []
+    metrics_for_each_example = []
+
     for sequence in tqdm(test_loader):
         x = utils.normalize_data(opt.dataset, dtype, sequence)
-        nsample = 5
-        gen_seq = [predict(x) for _ in range(nsample)]
+        if encoder_only:
+            nsample = 1
+            gen_seq = [predict_decoding(x)]
+        else:
+            nsample = 5
+            gen_seq = [predict(x) for _ in range(nsample)]
+
         gt_seq = [x[i] for i in range(len(x))]
+
+        assert len(gen_seq[0]) == len(gt_seq)
+        assert gen_seq[0][0].shape == gt_seq[0].shape
         
         for i in tqdm(range(opt.batch_size), leave=False):
             # Finds best sequence (lowest loss)
@@ -453,36 +514,57 @@ if opt.test:
             for s in range(nsample):
                 Y_pred = []
                 Y_true = []
-                Y_pred_unnormed = []
-                Y_true_unnormed = []
 
                 for t in range(opt.n_past, opt.n_eval):
                     y_pred_timestep = gen_seq[s][t][i].data.cpu().numpy()
                     y_true_timestep = gt_seq[t][i].data.cpu().numpy()
 
-                    Y_pred.append(y_pred_timestep)
-                    Y_true.append(y_true_timestep)
-                    Y_pred_unnormed.append(train_data.unnormalize(y_pred_timestep))
-                    Y_true_unnormed.append(train_data.unnormalize(y_true_timestep))
+                    Y_pred.append(train_data._unnormalize(y_pred_timestep))
+                    Y_true.append(train_data._unnormalize(y_true_timestep))
 
-                mse_per_band = compute_mse(Y_true, Y_pred)
+                metrics_for_example = compute_metrics(Y_true, Y_pred)
                 
-                if min_mse is None or  min_mse > mse_per_band.sum():
-                    min_mse = mse_per_band.sum()
-                    lowest_normed_mse_pixel = mse_per_band
-                    lowest_unnormed_mse_pixel =  compute_mse(Y_true_unnormed, Y_pred_unnormed)
+                if min_mse is None or  min_mse > metrics_for_example["mse"]:
+                    min_mse = metrics_for_example["mse"]
+                    lowest_metrics_for_example = metrics_for_example
             
-            normalized_mse_list.append(lowest_normed_mse_pixel)
-            unnormalized_mse_list.append(lowest_unnormed_mse_pixel)
-    mean_mse_per_bands = np.array(normalized_mse_list).mean(axis=0)
-    mean_unnormalized_mse_per_bands = np.array(unnormalized_mse_list).mean(axis=0)
-    print(f"Normalized_mse {mean_mse_per_bands}")
-    print(f"Unnormalized_mse {mean_unnormalized_mse_per_bands}")
+            metrics_for_each_example.append(lowest_metrics_for_example)
+
+    metrics_for_test_set = {
+        metric_type: np.array([m[metric_type] for m in metrics_for_each_example]).mean(axis=0)
+        for metric_type in ["mse", "l1", "ssim"]
+    }
+
+    for metric_type, metric in metrics_for_test_set.items():
+        print(f"{metric_type}: {metric}")
+
+    # Check if metrics json file exists
+    metrics_json_path = home_dir / "Results/metrics.json"
+    metrics_json_already_exists = metrics_json_path.exists()
+    if not metrics_json_already_exists:
+        metrics_json_path.touch()
+
+    # Read metrics json file
+    with open(metrics_json_path, "r") as f:
+        if metrics_json_already_exists:
+            metrics_json = json.load(f)
+        else:
+            metrics_json = {}
+
+        if opt.dataset not in metrics_json:
+            metrics_json[opt.dataset] = {}
+
+        metrics_json[opt.dataset][opt.model_path] = metrics_for_test_set
+
+    # Write new metrics to metrics json file
+    with open(metrics_json_path, "w") as f:
+        json.dump(metrics_json, f, ensure_ascii=False, indent=4)
+
 
 
 # --------- training loop ------------------------------------
 else:
-    writer = SummaryWriter(log_dir=f"runs/{dataset}/{opt.run_name}" if opt.run_name else None)
+    writer = SummaryWriter(log_dir=f"runs/{opt.dataset}/{opt.run_name}" if opt.run_name else None)
     epoch_size = len(train_loader)
     with gpytorch.settings.max_cg_iterations(45):
         for epoch in range(opt.niter):
@@ -529,12 +611,12 @@ else:
                 if opt.run_name:
                     model_name = opt.run_name
                 else:
-                    model_name = f'e2e_{dataset}_model'
+                    model_name = f'e2e_{opt.dataset}_model'
                 
                 if encoder_only:
                     model_name += '_autoencoder'
 
-                model_path = home_dir / f'model_dump/{dataset}/{model_name}.pth'
+                model_path = home_dir / f'model_dump/{opt.dataset}/{model_name}.pth'
                 model_path.parent.mkdir(parents=True, exist_ok=True)
                 torch.save({
                     'encoder': encoder,
