@@ -1,6 +1,6 @@
 import warnings
 
-from data.satellite import RGB_BANDS, Normalization
+from data.satellite import RGB_BANDS, ALL_BANDS, Normalization
 warnings.simplefilter("ignore", UserWarning)
 
 import torch
@@ -57,6 +57,8 @@ parser.add_argument('--run_name', type=str, default='', help='name of run')
 parser.add_argument('--loss', default="mse", help='loss function to use (mse | l1 | ssim | ssim_mse_point1 | ssim_mse_point01 | ssim_l1_point1 | ssim_l1_point01 )')
 parser.add_argument('--normalization', type=str, default="z", help='normalization to use (z | minmax | skip | clip5_minmax | clip4_minmax | clip3_minmax)')
 parser.add_argument('--components', type=str, default="all", help='components to train (encoder | encoder_lstm | all)')
+parser.add_argument('--interval_for_gp_layer', type=int, default=10, help='interval at which gaussian process is triggered')
+parser.add_argument('--patch_size', type=int, default=64, help='size of patch')
 
 opt = parser.parse_args()
 print("Random Seed: ", opt.seed)
@@ -71,8 +73,6 @@ torch.cuda.manual_seed_all(opt.seed)
 dtype = torch.cuda.FloatTensor
 
 # ---------------- load the models  ----------------
-print(opt)
-
 lr = opt.lr
 loss_type = opt.loss
 
@@ -81,10 +81,22 @@ if opt.model_path == '':
         raise ValueError('Must specify model path if testing')
 
     # ---------------- initialize the new model -------------
-    from models import dcgan_64, vgg_64
+    from models import dcgan_64, vgg_64, dcgan_32, dcgan_16, dcgan_8
     if opt.model == 'dcgan':
-        encoder = dcgan_64.encoder(opt.g_dim, opt.channels)
-        decoder = dcgan_64.decoder(opt.g_dim, opt.channels)
+        if opt.patch_size == 64:
+            encoder = dcgan_64.encoder(opt.g_dim, opt.channels)
+            decoder = dcgan_64.decoder(opt.g_dim, opt.channels)
+        elif opt.patch_size == 32:
+            encoder = dcgan_32.encoder(opt.g_dim, opt.channels)
+            decoder = dcgan_32.decoder(opt.g_dim, opt.channels)
+        elif opt.patch_size == 16:
+            encoder = dcgan_16.encoder(opt.g_dim, opt.channels)
+            decoder = dcgan_16.decoder(opt.g_dim, opt.channels)
+        elif opt.patch_size == 8:
+            encoder = dcgan_8.encoder(opt.g_dim, opt.channels)
+            decoder = dcgan_8.decoder(opt.g_dim, opt.channels)
+        else:
+            raise ValueError('Invalid patch size')
     else:
         encoder = vgg_64.encoder(opt.g_dim, opt.channels)
         decoder = vgg_64.decoder(opt.g_dim, opt.channels)
@@ -92,8 +104,8 @@ if opt.model_path == '':
     encoder.apply(utils.init_weights)
     decoder.apply(utils.init_weights)
 
-    import models.lstm as lstm_models 
-    frame_predictor = lstm_models.lstm(opt.g_dim, opt.g_dim, opt.rnn_size, opt.predictor_rnn_layers, opt.batch_size)
+    import models.lstm as lstm_models
+    frame_predictor = lstm_models.lstm(opt.g_dim, opt.g_dim, opt.rnn_size, opt.predictor_rnn_layers)
     frame_predictor.apply(utils.init_weights)
 
 else:
@@ -107,11 +119,13 @@ else:
     frame_predictor = model['frame_predictor']
 
     opt_dict = vars(model['opt'])
-    for opt_key in ["data_root", "dataset", "n_past", "n_future", "n_eval", "image_width", "channels", "components", "normalization"]:
+    for opt_key in ["data_root", "dataset", "n_past", "n_future", "n_eval", "image_width", "channels", "components", "normalization", "batch_size", "patch_size"]:
         if opt_key in opt_dict:
             setattr(opt, opt_key, opt_dict[opt_key])
 
+print(opt)
 assert opt.components in ["encoder", "encoder_lstm", "all"]
+assert opt.image_width % opt.patch_size == 0
 encoder_only = opt.components == "encoder"
 encoder_lstm_only = opt.components == "encoder_lstm"
 
@@ -121,7 +135,7 @@ decoder.cuda()
 frame_predictor.cuda()
 
 # --------- load a dataset ------------------------------------
-train_data, test_data = utils.load_dataset(opt, bands_to_keep=RGB_BANDS, normalization=Normalization(opt.normalization))
+train_data, test_data = utils.load_dataset(opt, bands_to_keep=ALL_BANDS, normalization=Normalization(opt.normalization))
 
 num_workers = opt.data_threads
 if opt.dataset == "satellite":
@@ -261,6 +275,7 @@ def train(x, global_step, tb_writer):
         max_ll = 0
         ae_loss = 0
         for i in range(1, opt.n_past+opt.n_future):
+            assert x[i-1].shape == (opt.batch_size, opt.channels, opt.patch_size, opt.patch_size)
             h = encoder(x[i-1])
             h_target = encoder(x[i])[0]
 
@@ -313,38 +328,70 @@ def train(x, global_step, tb_writer):
 
         return loss.data.cpu().numpy()/(opt.n_past+opt.n_future)
 
+
+# --------- patching functions ------------------------------------
+def generate_patches(x: List[torch.Tensor]) -> List[List[torch.Tensor]]:
+    assert x[0].shape == (opt.batch_size, opt.channels, opt.image_width, opt.image_width), x.shape
+    if opt.patch_size == opt.image_width:
+        return [x]
+    x_patches = []
+    for j in range(0, opt.image_width, opt.patch_size):
+        for k in range(0, opt.image_width, opt.patch_size):
+            x_patch = [x_timestep[:, :, j:j+opt.patch_size, k:k+opt.patch_size] for x_timestep in x]
+            assert x_patch[0].shape == (opt.batch_size, opt.channels, opt.patch_size, opt.patch_size), x_patch.shape
+            assert len(x_patch) == len(x)
+            x_patches.append(x_patch)
+    return x_patches
+
+def merge_patches(x_patches: List[List[torch.Tensor]]) -> List[torch.Tensor]:
+    if len(x_patches) == 1:
+        return x_patches[0]
+    reconstructed_x = []
+    for i in range(opt.n_past+opt.n_future):
+        reconstructed_x_timestep = torch.zeros(opt.batch_size, opt.channels, opt.image_width, opt.image_width)
+        for j in range(0, opt.image_width, opt.patch_size):
+            for k in range(0, opt.image_width, opt.patch_size):
+                patch_idx = k//opt.patch_size + j//opt.patch_size*(opt.image_width//opt.patch_size)
+                reconstructed_x_timestep[:, :, j:j+opt.patch_size, k:k+opt.patch_size]  = x_patches[patch_idx][i]
+        reconstructed_x.append(reconstructed_x_timestep)
+    return reconstructed_x
+
 # --------- predicting functions ------------------------------------
-def predict(x, interval_for_gp_layer: int = 10) -> List[torch.Tensor]:
+def predict(x) -> List[torch.Tensor]:
     frame_predictor.hidden = frame_predictor.init_hidden() # Initialize LSTM hidden state
-    gen_seq = [x[0]]
-    for i in range(1, opt.n_eval):
+    
+    x_patches = generate_patches(x)
+    gen_seq_per_patch = []
+    for x_patch in x_patches:
+        gen_seq = [x_patch[0]]
+        for i in range(1, opt.n_eval):
 
-        # Encode the input time step
-        h = encoder(gen_seq[-1])   
-        if opt.last_frame_skip or i < opt.n_past:   
-            h, skip = h     # Extract encoding and skip-connection?
-        else:
-            h, _ = h        # Extract encoding only
-        h = h.detach()
+            # Encode the input time step
+            h = encoder(gen_seq[-1])   
+            if opt.last_frame_skip or i < opt.n_past:   
+                h, skip = h     # Extract encoding and skip-connection?
+            else:
+                h, _ = h        # Extract encoding only
+            h = h.detach()
 
-        # Predict the next time step using the LSTM (needs to be called each time to update the hidden state)
-        h_pred = frame_predictor(h).detach()
-        
-        # Use the GP layer to predict the next time step
-        # Previously i%10 was used for longer sequences
-        if not encoder_lstm_only and i % interval_for_gp_layer == 0: 
-            h_pred_from_gp_layer = likelihood(gp_layer(h.transpose(0,1).view(90,opt.batch_size,1)))
-            h_pred = h_pred_from_gp_layer.rsample().transpose(0,1)
-        
+            # Predict the next time step using the LSTM (needs to be called each time to update the hidden state)
+            h_pred = frame_predictor(h).detach()
+            
+            # Use the GP layer to predict the next time step
+            # Previously i%10 was used for longer sequences
+            if not encoder_lstm_only and i % opt.interval_for_gp_layer == 0: 
+                h_pred_from_gp_layer = likelihood(gp_layer(h.transpose(0,1).view(90,opt.batch_size,1)))
+                h_pred = h_pred_from_gp_layer.rsample().transpose(0,1)
+            
 
-        # Add timestep to generated sequence
-        if i < opt.n_past:
-            gen_seq.append(x[i])
-        else:
-            decoded_h_pred = decoder([h_pred,skip]).detach()
-            gen_seq.append(decoded_h_pred )
-
-    return gen_seq
+            # Add timestep to generated sequence
+            if i < opt.n_past:
+                gen_seq.append(x_patch[i])
+            else:
+                decoded_h_pred = decoder([h_pred,skip]).detach()
+                gen_seq.append(decoded_h_pred)
+        gen_seq_per_patch.append(torch.stack(gen_seq))
+    return merge_patches(gen_seq_per_patch)
 
 def predict_decoding(x) -> List[torch.Tensor]:
     gen_seq = [x[0]]
@@ -456,6 +503,7 @@ def plot(x, epoch):
 def compute_metrics(Y_pred: List[np.ndarray], Y_true: List[np.ndarray]) -> np.ndarray:
     metric_per_timestep = {
         "mse": [],
+        "mse_per_band": [],
         "l1": [],
         "ssim": [],
     }
@@ -466,12 +514,15 @@ def compute_metrics(Y_pred: List[np.ndarray], Y_true: List[np.ndarray]) -> np.nd
             y_true = torch.unsqueeze(Y_true_tensor[i], 0)
             y_pred = torch.unsqueeze(Y_pred_tensor[i], 0)
             
-            assert y_true.shape == (1, 3, opt.image_width, opt.image_width)
+            assert y_true.shape == (1, opt.channels, opt.image_width, opt.image_width)
             assert y_true.shape == y_pred.shape
 
             mse_for_timestep = mse(y_true, y_pred).item()
             metric_per_timestep["mse"].append(mse_for_timestep)
             assert np.isclose(mse_for_timestep, ((Y_true[i] - Y_pred[i])**2).mean()), f"{mse_for_timestep} and {((Y_true[i] - Y_pred[i])**2).mean()}"
+            mse_for_timestep_per_band = ((Y_true[i] - Y_pred[i])**2).mean(axis=(-1,-2))
+            assert mse_for_timestep_per_band.shape == (opt.channels,)
+            metric_per_timestep["mse_per_band"].append(mse_for_timestep_per_band)
             
             l1_for_timestep = l1(y_true, y_pred).item()
             metric_per_timestep["l1"].append(l1_for_timestep)
@@ -479,12 +530,10 @@ def compute_metrics(Y_pred: List[np.ndarray], Y_true: List[np.ndarray]) -> np.nd
 
             metric_per_timestep["ssim"].append(ssim(y_true, y_pred).item())
 
-    metric_for_example = {}
-    for metric_type, metric_values in metric_per_timestep.items():
-        assert len(metric_values) == len(Y_pred), f"{metric_type} does not have enough values"
-        metric_for_example[metric_type] = np.mean(metric_values)
 
+    metric_for_example = {metric_type: np.mean(values_per_timestep, axis=0) for metric_type, values_per_timestep in metric_per_timestep.items()}
     return metric_for_example
+
 
 if opt.test:
     frame_predictor.eval()
@@ -499,6 +548,9 @@ if opt.test:
         if encoder_only:
             nsample = 1
             gen_seq = [predict_decoding(x)]
+        elif encoder_lstm_only:
+            nsample = 1
+            gen_seq = [predict(x)]
         else:
             nsample = 5
             gen_seq = [predict(x) for _ in range(nsample)]
@@ -518,9 +570,13 @@ if opt.test:
                 for t in range(opt.n_past, opt.n_eval):
                     y_pred_timestep = gen_seq[s][t][i].data.cpu().numpy()
                     y_true_timestep = gt_seq[t][i].data.cpu().numpy()
+                    if opt.dataset == "satellite":
+                        Y_pred.append(train_data._unnormalize(y_pred_timestep))
+                        Y_true.append(train_data._unnormalize(y_true_timestep))
+                    else:
+                        Y_pred.append(y_pred_timestep)
+                        Y_true.append(y_true_timestep)
 
-                    Y_pred.append(train_data._unnormalize(y_pred_timestep))
-                    Y_true.append(train_data._unnormalize(y_true_timestep))
 
                 metrics_for_example = compute_metrics(Y_true, Y_pred)
                 
@@ -530,10 +586,11 @@ if opt.test:
             
             metrics_for_each_example.append(lowest_metrics_for_example)
 
-    metrics_for_test_set = {
-        metric_type: np.array([m[metric_type] for m in metrics_for_each_example]).mean(axis=0)
-        for metric_type in ["mse", "l1", "ssim"]
-    }
+    metrics_for_test_set = {}
+    for metric_type in metrics_for_each_example[0].keys():
+        mean_metric = np.array([m[metric_type] for m in metrics_for_each_example]).mean(axis=0)
+        metrics_for_test_set[metric_type] = mean_metric if type(mean_metric) is not np.ndarray else list(mean_metric)
+    
 
     for metric_type, metric in metrics_for_test_set.items():
         print(f"{metric_type}: {metric}")
@@ -583,8 +640,11 @@ else:
                 progress.update(i+1)
                 x = next(training_batch_generator)
                 global_step=epoch * epoch_size + i
-                batch_loss = train(x, global_step, writer) 
-                epoch_loss += batch_loss
+                x_patches = generate_patches(x)
+                random.shuffle(x_patches)
+                for x_patch in x_patches:
+                    batch_loss = train(x_patch, global_step, writer) 
+                    epoch_loss += batch_loss
 
             progress.finish()
             utils.clear_progressbar()
