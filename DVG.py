@@ -96,6 +96,9 @@ if opt.model_path == '':
         elif opt.patch_size == 8:
             encoder = dcgan_8.encoder(opt.g_dim, opt.channels)
             decoder = dcgan_8.decoder(opt.g_dim, opt.channels)
+        elif opt.patch_size == 1:
+            encoder = nn.Identity()
+            decoder = nn.Identity()
         else:
             raise ValueError('Invalid patch size')
     else:
@@ -129,10 +132,11 @@ else:
 
 print("Arguments:")
 print(opt)
-assert opt.components in ["encoder", "encoder_lstm", "all"]
+assert opt.components in ["encoder", "encoder_lstm", "lstm", "all"]
 assert opt.image_width % opt.patch_size == 0
 encoder_only = opt.components == "encoder"
 encoder_lstm_only = opt.components == "encoder_lstm"
+lstm_only = opt.components == "lstm"
 
 # ---------------- models tranferred to GPU ----------------
 print("Moving models to CUDA")
@@ -165,8 +169,9 @@ test_loader = DataLoader(test_data,
 
 # ---------------- optimizers ----------------
 frame_predictor_optimizer = torch.optim.Adam(frame_predictor.parameters(), lr = lr)
-encoder_optimizer = torch.optim.Adam(encoder.parameters(),lr = lr)
-decoder_optimizer = torch.optim.Adam(decoder.parameters(),lr = lr)
+if not lstm_only:
+    encoder_optimizer = torch.optim.Adam(encoder.parameters(),lr = lr)
+    decoder_optimizer = torch.optim.Adam(decoder.parameters(),lr = lr)
 
 
 # ---------------- GP initialization ----------------------
@@ -266,7 +271,34 @@ def train(x, global_step, tb_writer):
         decoder_optimizer.step()
 
         return ae_loss.data.cpu().numpy()/(opt.n_past+opt.n_future)
-    
+
+    elif lstm_only:
+        frame_predictor.zero_grad()
+
+        # initialize the hidden state.
+        frame_predictor.hidden = frame_predictor.init_hidden()
+
+        # pdb.set_trace()
+        lstm_loss = 0
+        latent_loss = 0
+        gp_loss = 0
+        max_ll = 0
+        ae_loss = 0
+        for i in range(1, opt.n_past+opt.n_future):
+            assert x[i-1].shape == (opt.batch_size, opt.channels, opt.patch_size, opt.patch_size)            
+            x_pred = frame_predictor(x[i-1])                         
+            lstm_loss += reconstruction_loss_func(x_pred, x[i])      
+            torch.cuda.empty_cache()
+
+        lstm_loss.backward()
+
+        tb_writer.add_scalar("Step Loss/LSTM", lstm_loss , global_step)
+
+        frame_predictor_optimizer.step()
+
+        return lstm_loss.data.cpu().numpy()/(opt.n_past+opt.n_future)
+
+        
     else:
 
 
@@ -400,6 +432,22 @@ def predict(x) -> List[torch.Tensor]:
         gen_seq_per_patch.append(torch.stack(gen_seq))
     return merge_patches(gen_seq_per_patch)
 
+def predict_lstm(x) -> List[torch.Tensor]:
+    frame_predictor.hidden = frame_predictor.init_hidden() # Initialize LSTM hidden state
+    x_patches = generate_patches(x)
+    gen_seq_per_patch = []
+    for x_patch in x_patches:
+        gen_seq = [x_patch[0]]
+        for i in range(1, opt.n_eval):
+            x_pred = frame_predictor(x[i-1]).detach()    
+            # Add timestep to generated sequence
+            if i < opt.n_past:
+                gen_seq.append(x_patch[i])
+            else:
+                gen_seq.append(x_pred)
+        gen_seq_per_patch.append(torch.stack(gen_seq))
+    return merge_patches(gen_seq_per_patch)
+
 def predict_decoding(x) -> List[torch.Tensor]:
     gen_seq = [x[0]]
     for i in range(1, opt.n_eval):
@@ -425,6 +473,8 @@ def plot(x, epoch):
 
     if encoder_only:
         gen_seq = [predict_decoding(x)]
+    elif lstm_only:
+        gen_seq = [predict_lstm(x)]
     elif encoder_lstm_only:
         gen_seq = [predict(x)]
     else:
@@ -555,6 +605,9 @@ if opt.test:
         if encoder_only:
             nsample = 1
             gen_seq = [predict_decoding(x)]
+        elif lstm_only:
+            nsample = 1
+            gen_seq = [predict_lstm(x)]
         elif encoder_lstm_only:
             nsample = 1
             gen_seq = [predict(x)]
