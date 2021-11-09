@@ -105,7 +105,7 @@ if opt.model_path == '':
     decoder.apply(utils.init_weights)
 
     import models.lstm as lstm_models
-    frame_predictor = lstm_models.lstm(opt.g_dim, opt.g_dim, opt.rnn_size, opt.predictor_rnn_layers)
+    frame_predictor = lstm_models.lstm(opt.g_dim, opt.g_dim, opt.rnn_size, opt.predictor_rnn_layers, opt.batch_size)
     frame_predictor.apply(utils.init_weights)
 
 else:
