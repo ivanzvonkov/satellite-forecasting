@@ -13,12 +13,15 @@ import utils
 import progressbar, pdb
 import numpy as np
 import gpytorch
+import wandb
+from collections import defaultdict
 from models.gp_models import GPRegressionLayer1
 from pytorch_ssim import SSIM
 from typing import List
-from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from pathlib import Path
+
+wandb.init(project="satellite-forecasting", entity="izvonkov")
 
 
 parser = argparse.ArgumentParser()
@@ -61,6 +64,8 @@ parser.add_argument('--interval_for_gp_layer', type=int, default=10, help='inter
 parser.add_argument('--patch_size', type=int, default=64, help='size of patch')
 
 opt = parser.parse_args()
+wandb.config.update(opt)
+
 print("Random Seed: ", opt.seed)
 random.seed(opt.seed)
 torch.manual_seed(opt.seed)
@@ -247,7 +252,7 @@ def get_testing_batch():
 testing_batch_generator = get_testing_batch()
 
 # # --------- training funtions ------------------------------------
-def train(x, global_step, tb_writer):
+def train(x, epoch):
     encoder.zero_grad()
     decoder.zero_grad()
 
@@ -265,12 +270,10 @@ def train(x, global_step, tb_writer):
         
         ae_loss.backward()
 
-        tb_writer.add_scalar(f"Step Loss/Encoder {loss_type}", ae_loss, global_step)
-
         encoder_optimizer.step()
         decoder_optimizer.step()
 
-        return ae_loss.data.cpu().numpy()/(opt.n_past+opt.n_future)
+        return {f"Train/Encoder {loss_type}": ae_loss}
 
     elif lstm_only:
         frame_predictor.zero_grad()
@@ -292,16 +295,12 @@ def train(x, global_step, tb_writer):
 
         lstm_loss.backward()
 
-        tb_writer.add_scalar("Step Loss/LSTM", lstm_loss , global_step)
-
         frame_predictor_optimizer.step()
 
-        return lstm_loss.data.cpu().numpy()/(opt.n_past+opt.n_future)
+        return {"Train/LSTM": lstm_loss}
 
         
     else:
-
-
         frame_predictor.zero_grad()
 
         # initialize the hidden state.
@@ -349,14 +348,16 @@ def train(x, global_step, tb_writer):
         if not encoder_lstm_only:
             loss += beta*gp_loss + beta*max_ll.sum()
 
-        tb_writer.add_scalar(f"Step Loss/Encoder {loss_type}", ae_loss, global_step)
-        tb_writer.add_scalar("Step Loss/Encoder and LSTM", lstm_loss, global_step)
-        tb_writer.add_scalar("Step Loss/LSTM", latent_loss , global_step)
-
+        to_log = {
+            f"Train/Encoder {loss_type}": ae_loss,
+            "Train/Encoder and LSTM": lstm_loss,
+            "Train/LSTM": latent_loss,
+            "Train/Total": loss
+        }
+        
         if not encoder_lstm_only:
-            tb_writer.add_scalar("Step Loss/Encoder and GP loss", gp_loss, global_step)
-            tb_writer.add_scalar("Step Loss/GP loss", max_ll.sum(), global_step)
-        tb_writer.add_scalar("Step Loss/Total", loss, global_step)
+            to_log["Train/GP"] = gp_loss,
+            to_log["Train/Max LL"] = max_ll.sum()
 
         loss.backward()
 
@@ -365,7 +366,7 @@ def train(x, global_step, tb_writer):
         decoder_optimizer.step()
         optimizer.step()
 
-        return loss.data.cpu().numpy()/(opt.n_past+opt.n_future)
+        return to_log
 
 
 # --------- patching functions ------------------------------------
@@ -549,11 +550,12 @@ def plot(x, epoch):
     img_path.parent.mkdir(parents=True, exist_ok=True)
     tensor_of_images = utils.save_tensors_image(str(img_path), to_plot)
     print(f"Saving image to: {img_path}")
+    return tensor_of_images
 
-    gif_path = home_dir / f'gifs/{opt.dataset}/{file_name}.gif'
-    gif_path.parent.mkdir(parents=True, exist_ok=True)
-    utils.save_gif(str(gif_path), gifs)
-    print(f"Saving images as gif: {gif_path}")
+    # gif_path = home_dir / f'gifs/{opt.dataset}/{file_name}.gif'
+    # gif_path.parent.mkdir(parents=True, exist_ok=True)
+    # utils.save_gif(str(gif_path), gifs)
+    # print(f"Saving images as gif: {gif_path}")
     
 
 # --------- testing loop ------------------------------------
@@ -681,7 +683,6 @@ if opt.test:
 
 # --------- training loop ------------------------------------
 else:
-    writer = SummaryWriter(log_dir=f"runs/{opt.dataset}/{opt.run_name}" if opt.run_name else None)
     epoch_size = len(train_loader)
     with gpytorch.settings.max_cg_iterations(45):
         for epoch in range(opt.niter):
@@ -696,23 +697,19 @@ else:
             for i in range(epoch_size):
                 progress.update(i+1)
                 x = next(training_batch_generator)
-                global_step=epoch * epoch_size + i
                 x_patches = generate_patches(x)
                 #random.shuffle(x_patches)
+                step_loss_dict = defaultdict(lambda: 0)
+                step_loss_dict["Epoch"] = epoch
                 for x_patch in x_patches:
-                    batch_loss = train(x_patch, global_step, writer) 
-                    epoch_loss += batch_loss
+                    step_patch_loss_dict = train(x_patch, epoch) 
+                    for k,v in step_patch_loss_dict.items():
+                        step_loss_dict[k] += v
+                    
+                wandb.log(step_loss_dict)
 
             progress.finish()
             utils.clear_progressbar()
-
-            mean_epoch_loss = epoch_loss/epoch_size
-            if encoder_only:
-                writer.add_scalar(f"Epoch Loss/Encoder {loss_type}", mean_epoch_loss, epoch)
-            else:
-                writer.add_scalar("Epoch Loss/Total", mean_epoch_loss, epoch)
-            
-            print('[%02d] mse loss: %.5f (%d) %.5f' % (epoch, mean_epoch_loss, epoch*epoch_size*opt.batch_size, batch_loss))
             
             if epoch % 4 == 0:
             
@@ -722,7 +719,8 @@ else:
                 likelihood.eval()
 
                 test_x = next(testing_batch_generator)
-                plot(test_x, epoch)
+                tensor_of_images = plot(test_x, epoch)
+                wandb.log({"Test/Images": wandb.Image(tensor_of_images)}, commit=False)
 
                 # save the model
                 if opt.run_name:
@@ -747,4 +745,3 @@ else:
 
             if epoch % 10 == 0:
                 print('log dir: %s' % opt.log_dir)
-        writer.flush()
