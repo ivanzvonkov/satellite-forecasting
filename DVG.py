@@ -81,6 +81,7 @@ if opt.model_path == '':
         raise ValueError('Must specify model path if testing')
 
     # ---------------- initialize the new model -------------
+    print('Initializing encoder...')
     from models import dcgan_64, vgg_64, dcgan_32, dcgan_16, dcgan_8
     if opt.model == 'dcgan':
         if opt.patch_size == 64:
@@ -104,8 +105,11 @@ if opt.model_path == '':
     encoder.apply(utils.init_weights)
     decoder.apply(utils.init_weights)
 
+    print('Importing LSTM models')
     import models.lstm as lstm_models
+    print('Initializing LSTM...')
     frame_predictor = lstm_models.lstm(opt.g_dim, opt.g_dim, opt.rnn_size, opt.predictor_rnn_layers, opt.batch_size)
+    print('Applying LSTM weights...')
     frame_predictor.apply(utils.init_weights)
 
 else:
@@ -123,6 +127,7 @@ else:
         if opt_key in opt_dict:
             setattr(opt, opt_key, opt_dict[opt_key])
 
+print("Arguments:")
 print(opt)
 assert opt.components in ["encoder", "encoder_lstm", "all"]
 assert opt.image_width % opt.patch_size == 0
@@ -130,11 +135,13 @@ encoder_only = opt.components == "encoder"
 encoder_lstm_only = opt.components == "encoder_lstm"
 
 # ---------------- models tranferred to GPU ----------------
+print("Moving models to CUDA")
 encoder.cuda()
 decoder.cuda()
 frame_predictor.cuda()
 
 # --------- load a dataset ------------------------------------
+print('Loading data...')
 train_data, test_data = utils.load_dataset(opt, bands_to_keep=ALL_BANDS, normalization=Normalization(opt.normalization))
 
 num_workers = opt.data_threads
@@ -631,17 +638,14 @@ else:
             encoder.train()
             decoder.train()
             scheduler.step()
-
             epoch_loss = 0
             progress = progressbar.ProgressBar(epoch_size).start()
-            
             for i in range(epoch_size):
-                
                 progress.update(i+1)
                 x = next(training_batch_generator)
                 global_step=epoch * epoch_size + i
                 x_patches = generate_patches(x)
-                random.shuffle(x_patches)
+                #random.shuffle(x_patches)
                 for x_patch in x_patches:
                     batch_loss = train(x_patch, global_step, writer) 
                     epoch_loss += batch_loss
