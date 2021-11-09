@@ -8,3 +8,4 @@ imgs
 model_dump
 runs
 .env
+wandb
