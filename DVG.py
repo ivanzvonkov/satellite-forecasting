@@ -28,7 +28,7 @@ parser.add_argument('--batch_size', default=50, type=int, help='batch size')
 parser.add_argument('--log_dir', default='logs_final_version_gp', help='base directory to save logs')
 parser.add_argument('--model_dir', default='', help='base directory to save logs')
 parser.add_argument('--name', default='', help='identifier for directory')
-parser.add_argument('--data_root', default='data', help='root directory for data')
+parser.add_argument('--data_root', default='/cmlscratch/izvonkov/DVG/data', help='root directory for data')
 parser.add_argument('--optimizer', default='adam', help='optimizer to train with')
 parser.add_argument('--niter', type=int, default=1200, help='number of epochs to train for')
 parser.add_argument('--seed', default=1, type=int, help='manual seed')
@@ -81,13 +81,19 @@ if opt.model_path == '':
         raise ValueError('Must specify model path if testing')
 
     # ---------------- initialize the new model -------------
-    from models import dcgan_64, vgg_64
+    from models import dcgan_64, vgg_64, vae, vae_small
     if opt.model == 'dcgan':
         encoder = dcgan_64.encoder(opt.g_dim, opt.channels)
         decoder = dcgan_64.decoder(opt.g_dim, opt.channels)
-    else:
+    elif opt.model == 'vgg':
         encoder = vgg_64.encoder(opt.g_dim, opt.channels)
         decoder = vgg_64.decoder(opt.g_dim, opt.channels)
+    elif opt.model == 'vae':
+        encoder = vae.encoder(opt.g_dim, opt.channels)
+        decoder = vae.decoder(opt.g_dim, opt.channels)
+    elif opt.model == 'vae_small':
+        encoder = vae_small.encoder(opt.g_dim, opt.channels)
+        decoder = vae_small.decoder(opt.g_dim, opt.channels)
 
     encoder.apply(utils.init_weights)
     decoder.apply(utils.init_weights)
