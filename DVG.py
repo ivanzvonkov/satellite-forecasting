@@ -28,7 +28,7 @@ parser.add_argument('--batch_size', default=50, type=int, help='batch size')
 parser.add_argument('--log_dir', default='logs_final_version_gp', help='base directory to save logs')
 parser.add_argument('--model_dir', default='', help='base directory to save logs')
 parser.add_argument('--name', default='', help='identifier for directory')
-parser.add_argument('--data_root', default='data', help='root directory for data')
+parser.add_argument('--data_root', default='/cmlscratch/izvonkov/DVG/data', help='root directory for data')
 parser.add_argument('--optimizer', default='adam', help='optimizer to train with')
 parser.add_argument('--niter', type=int, default=1200, help='number of epochs to train for')
 parser.add_argument('--seed', default=1, type=int, help='manual seed')
@@ -82,7 +82,7 @@ if opt.model_path == '':
 
     # ---------------- initialize the new model -------------
     print('Initializing encoder...')
-    from models import dcgan_64, vgg_64, dcgan_32, dcgan_16, dcgan_8
+    from models import dcgan_64, vgg_64, dcgan_32, dcgan_16, dcgan_8, vae, vae_small
     if opt.model == 'dcgan':
         if opt.patch_size == 64:
             encoder = dcgan_64.encoder(opt.g_dim, opt.channels)
@@ -98,6 +98,12 @@ if opt.model_path == '':
             decoder = dcgan_8.decoder(opt.g_dim, opt.channels)
         else:
             raise ValueError('Invalid patch size')
+    elif opt.model == 'vae':
+        encoder = vae.encoder(opt.g_dim, opt.channels)
+        decoder = vae.decoder(opt.g_dim, opt.channels)
+    elif opt.model == 'vae_small':
+        encoder = vae_small.encoder(opt.g_dim, opt.channels)
+        decoder = vae_small.decoder(opt.g_dim, opt.channels)
     else:
         encoder = vgg_64.encoder(opt.g_dim, opt.channels)
         decoder = vgg_64.decoder(opt.g_dim, opt.channels)
