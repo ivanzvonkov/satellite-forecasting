@@ -8,9 +8,8 @@ import torch.nn as nn
 import argparse
 import random
 from torch.utils.data import DataLoader
-import json
 import utils
-import progressbar, pdb
+import pdb
 import numpy as np
 import gpytorch
 import wandb
@@ -20,9 +19,7 @@ from pytorch_ssim import SSIM
 from typing import List
 from tqdm import tqdm
 from pathlib import Path
-
-wandb.init(project="satellite-forecasting", entity="izvonkov")
-
+from skimage.metrics import structural_similarity as ssim2
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--lr', default=0.002, type=float, help='learning rate')
@@ -64,72 +61,22 @@ parser.add_argument('--interval_for_gp_layer', type=int, default=10, help='inter
 parser.add_argument('--patch_size', type=int, default=64, help='size of patch')
 
 opt = parser.parse_args()
-wandb.config.update(opt)
+if not opt.test:
+    wandb.init(project="satellite-forecasting", entity="izvonkov")
+    wandb.config.update(opt)
 
 print("Random Seed: ", opt.seed)
 random.seed(opt.seed)
 torch.manual_seed(opt.seed)
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print('Using device:', device)
-
 home_dir = Path(opt.home_dir)
 
 torch.cuda.manual_seed_all(opt.seed)
 dtype = torch.cuda.FloatTensor
 
-# ---------------- load the models  ----------------
-lr = opt.lr
-loss_type = opt.loss
-
-if opt.model_path == '':
-    if opt.test:
-        raise ValueError('Must specify model path if testing')
-
-    # ---------------- initialize the new model -------------
-    print('Initializing encoder...')
-    from models import dcgan_64, vgg_64, dcgan_32, dcgan_16, dcgan_8
-    if opt.model == 'dcgan':
-        if opt.patch_size == 64:
-            encoder = dcgan_64.encoder(opt.g_dim, opt.channels)
-            decoder = dcgan_64.decoder(opt.g_dim, opt.channels)
-        elif opt.patch_size == 32:
-            encoder = dcgan_32.encoder(opt.g_dim, opt.channels)
-            decoder = dcgan_32.decoder(opt.g_dim, opt.channels)
-        elif opt.patch_size == 16:
-            encoder = dcgan_16.encoder(opt.g_dim, opt.channels)
-            decoder = dcgan_16.decoder(opt.g_dim, opt.channels)
-        elif opt.patch_size == 8:
-            encoder = dcgan_8.encoder(opt.g_dim, opt.channels)
-            decoder = dcgan_8.decoder(opt.g_dim, opt.channels)
-        elif opt.patch_size == 1:
-            encoder = nn.Identity()
-            decoder = nn.Identity()
-        else:
-            raise ValueError('Invalid patch size')
-    else:
-        encoder = vgg_64.encoder(opt.g_dim, opt.channels)
-        decoder = vgg_64.decoder(opt.g_dim, opt.channels)
-
-    encoder.apply(utils.init_weights)
-    decoder.apply(utils.init_weights)
-
-    print('Importing LSTM models')
-    import models.lstm as lstm_models
-    print('Initializing LSTM...')
-    frame_predictor = lstm_models.lstm(opt.g_dim, opt.g_dim, opt.rnn_size, opt.predictor_rnn_layers, opt.batch_size)
-    print('Applying LSTM weights...')
-    frame_predictor.apply(utils.init_weights)
-
-else:
-    # ---------------- load the trained model -------------
-
-    from models.gp_models import GPRegressionLayer1
-
+if opt.model_path:
     model = torch.load(opt.model_path)
-    encoder = model['encoder']
-    decoder = model['decoder']
-    frame_predictor = model['frame_predictor']
-
     opt_dict = vars(model['opt'])
     for opt_key in ["data_root", "dataset", "n_past", "n_future", "n_eval", "image_width", "channels", "components", "normalization", "batch_size", "patch_size"]:
         if opt_key in opt_dict:
@@ -139,24 +86,14 @@ print("Arguments:")
 print(opt)
 assert opt.components in ["encoder", "encoder_lstm", "lstm", "all"]
 assert opt.image_width % opt.patch_size == 0
-encoder_only = opt.components == "encoder"
-encoder_lstm_only = opt.components == "encoder_lstm"
-lstm_only = opt.components == "lstm"
-
-# ---------------- models tranferred to GPU ----------------
-print("Moving models to CUDA")
-encoder.cuda()
-decoder.cuda()
-frame_predictor.cuda()
 
 # --------- load a dataset ------------------------------------
 print('Loading data...')
 train_data, test_data = utils.load_dataset(opt, bands_to_keep=ALL_BANDS, normalization=Normalization(opt.normalization))
-
 num_workers = opt.data_threads
 if opt.dataset == "satellite":
-    print("Satellite dataset only works with num_workers=1")
-    num_workers = 1
+    print("Satellite dataset only works with num_workers=0")
+    num_workers = 0
 
 train_loader = DataLoader(train_data,
                           num_workers=num_workers,
@@ -167,34 +104,100 @@ train_loader = DataLoader(train_data,
 test_loader = DataLoader(test_data,
                          num_workers=num_workers,
                          batch_size=opt.batch_size,
-                         shuffle=True,
+                         shuffle=False,
                          drop_last=True,
                          pin_memory=True)
 
+# --------- Figure out which components to enable ------------------------------------
+encoder_enabled = opt.components in ["encoder", "encoder_lstm", "all"]     
+lstm_enabled =   opt.components in ["encoder_lstm", "lstm", "all"] 
+gp_enabled =    opt.components in ["all"]
+if lstm_enabled and not encoder_enabled:
+    opt.g_dim = opt.channels * opt.patch_size * opt.patch_size
+
+# ---------------- load the models  ----------------
+lr = opt.lr
+loss_type = opt.loss
+
+if opt.model_path and model:
+    # ---------------- load the trained model -------------
+    if encoder_enabled:
+        encoder = model['encoder']
+        decoder = model['decoder']
+    if lstm_enabled:
+        frame_predictor = model['frame_predictor']
+
+else:
+    if opt.test:
+        raise ValueError('Must specify model path if testing')
+
+    # ---------------- initialize the new model -------------
+    if encoder_enabled:
+        print('Initializing encoder...')
+        from models import dcgan_64, vgg_64, dcgan_32, dcgan_16, dcgan_8
+        if opt.model == 'dcgan':
+            if opt.patch_size == 64:
+                encoder = dcgan_64.encoder(opt.g_dim, opt.channels)
+                decoder = dcgan_64.decoder(opt.g_dim, opt.channels)
+            elif opt.patch_size == 32:
+                encoder = dcgan_32.encoder(opt.g_dim, opt.channels)
+                decoder = dcgan_32.decoder(opt.g_dim, opt.channels)
+            elif opt.patch_size == 16:
+                encoder = dcgan_16.encoder(opt.g_dim, opt.channels)
+                decoder = dcgan_16.decoder(opt.g_dim, opt.channels)
+            elif opt.patch_size == 8:
+                encoder = dcgan_8.encoder(opt.g_dim, opt.channels)
+                decoder = dcgan_8.decoder(opt.g_dim, opt.channels)
+            else:
+                raise ValueError('Invalid patch size')
+        else:
+            encoder = vgg_64.encoder(opt.g_dim, opt.channels)
+            decoder = vgg_64.decoder(opt.g_dim, opt.channels)
+
+        encoder.apply(utils.init_weights)
+        decoder.apply(utils.init_weights)
+
+    if lstm_enabled:
+        print('Importing LSTM models')
+        import models.lstm as lstm_models
+        print('Initializing LSTM...')
+        frame_predictor = lstm_models.lstm(opt.g_dim, opt.g_dim, opt.rnn_size, opt.predictor_rnn_layers, opt.batch_size)
+        print('Applying LSTM weights...')
+        frame_predictor.apply(utils.init_weights)
+
+# ---------------- models tranferred to GPU ----------------
+print("Moving models to CUDA")
+if encoder_enabled:
+    encoder.cuda()
+    decoder.cuda()
+if lstm_enabled:
+    frame_predictor.cuda()
 
 # ---------------- optimizers ----------------
-frame_predictor_optimizer = torch.optim.Adam(frame_predictor.parameters(), lr = lr)
-if not lstm_only:
+if encoder_enabled:
     encoder_optimizer = torch.optim.Adam(encoder.parameters(),lr = lr)
     decoder_optimizer = torch.optim.Adam(decoder.parameters(),lr = lr)
+if lstm_enabled:
+    frame_predictor_optimizer = torch.optim.Adam(frame_predictor.parameters(), lr = lr)
 
 
-# ---------------- GP initialization ----------------------
-from models.gp_models import GPRegressionLayer1
-gp_layer = GPRegressionLayer1().cuda()#inputs
-likelihood = gpytorch.likelihoods.GaussianLikelihood(batch_size=opt.g_dim).cuda()
+if gp_enabled:
+    # ---------------- GP initialization ----------------------
+    from models.gp_models import GPRegressionLayer1
+    gp_layer = GPRegressionLayer1().cuda()#inputs
+    likelihood = gpytorch.likelihoods.GaussianLikelihood(batch_size=opt.g_dim).cuda()
 
-if opt.model_path:
-    likelihood.load_state_dict(model['likelihood'])
-    gp_layer.load_state_dict(model['gp_layer'])
+    if opt.model_path:
+        likelihood.load_state_dict(model['likelihood'])
+        gp_layer.load_state_dict(model['gp_layer'])
 
 
-# ---------------- GP optimizer initialization ----------------------
-optimizer = torch.optim.Adam([{'params': gp_layer.parameters()}, {'params': likelihood.parameters()},], lr=0.002)
-scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[3, 5], gamma=0.1)
+    # ---------------- GP optimizer initialization ----------------------
+    optimizer = torch.optim.Adam([{'params': gp_layer.parameters()}, {'params': likelihood.parameters()},], lr=0.002)
+    scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[3, 5], gamma=0.1)
 
-# Our loss for GP object. We're using the VariationalELBO, which essentially just computes the ELBO
-mll = gpytorch.mlls.VariationalELBO(likelihood, gp_layer, num_data=opt.batch_size, combine_terms=True)
+    # Our loss for GP object. We're using the VariationalELBO, which essentially just computes the ELBO
+    mll = gpytorch.mlls.VariationalELBO(likelihood, gp_layer, num_data=opt.batch_size, combine_terms=True)
 
 # --------- loss functions ------------------------------------
 
@@ -251,122 +254,124 @@ def get_testing_batch():
             yield batch 
 testing_batch_generator = get_testing_batch()
 
-# # --------- training funtions ------------------------------------
-def train(x, epoch):
-    encoder.zero_grad()
-    decoder.zero_grad()
+# # --------- training/evaluation funtions ------------------------------------
+def run_batch(x, train: bool = True):  
 
-    if encoder_only:
-        ae_loss = 0
-        for i in range(1, opt.n_past+opt.n_future):
-            h_pred = encoder(x[i])[0]
+    if encoder_enabled and train:
+        encoder.zero_grad()
+        decoder.zero_grad()
+    
+    if lstm_enabled:
+        if train:
+            frame_predictor.zero_grad()
+        # initialize the hidden state.
+        frame_predictor.hidden = frame_predictor.init_hidden()
+
+    lstm_loss = 0
+    latent_loss = 0
+    gp_loss = 0
+    max_ll = 0
+    ae_loss = 0
+    x_in = x[0]
+    if not train:
+        gen_seq = [x[0].detach()]
+    for i in range(1, opt.n_past+opt.n_future):
+        assert x_in.shape == (opt.batch_size, opt.channels, opt.patch_size, opt.patch_size), f"x_in.shape = {x_in.shape}"
+
+        if encoder_enabled:
+            # Encode past frame
             if opt.last_frame_skip or i < opt.n_past:   
-                skip = encoder(x[i-1])[1]
-
-            decoded = decoder([h_pred, skip])
-            assert x[i].shape == decoded.shape
-            ae_loss += reconstruction_loss_func(decoded, x[i])
-            torch.cuda.empty_cache()
+                h, skip = encoder(x_in)
+            else:
+                h, _ = encoder(x_in)
         
-        ae_loss.backward()
+        if encoder_enabled and lstm_enabled:
+            h_pred = frame_predictor(h)  
+            x_pred = decoder([h_pred, skip])  
+        elif lstm_enabled:
+            x_pred = frame_predictor(x_in)
+            if x_pred.shape != x_in.shape:
+                x_pred = x_pred.view(x_in.shape)                  
 
-        encoder_optimizer.step()
-        decoder_optimizer.step()
+        if encoder_enabled and gp_enabled:
+            # Make latent prediction with GP
+            gp_pred = gp_layer(h.transpose(0,1).view(90,opt.batch_size,1)) #likelihood(gp_layer(h.transpose(0,1).view(90,opt.batch_size,1)))#
+            x_pred_gp = decoder([gp_pred.mean.transpose(0,1), skip])
 
-        return {f"Train/Encoder {loss_type}": ae_loss}
 
-    elif lstm_only:
-        frame_predictor.zero_grad()
+        # Add timestep to generated sequence
+        if i < opt.n_past:
+            x_in = x[i]
+        else:
+            x_in = x_pred
 
-        # initialize the hidden state.
-        frame_predictor.hidden = frame_predictor.init_hidden()
+        if not train:
+            gen_seq.append(x_in.detach())   
 
-        # pdb.set_trace()
-        lstm_loss = 0
-        latent_loss = 0
-        gp_loss = 0
-        max_ll = 0
-        ae_loss = 0
-        for i in range(1, opt.n_past+opt.n_future):
-            assert x[i-1].shape == (opt.batch_size, opt.channels, opt.patch_size, opt.patch_size)            
-            x_pred = frame_predictor(x[i-1])                         
-            lstm_loss += reconstruction_loss_func(x_pred, x[i])      
-            torch.cuda.empty_cache()
-
-        lstm_loss.backward()
-
-        frame_predictor_optimizer.step()
-
-        return {"Train/LSTM": lstm_loss}
-
-        
-    else:
-        frame_predictor.zero_grad()
-
-        # initialize the hidden state.
-        frame_predictor.hidden = frame_predictor.init_hidden()
-
-        # pdb.set_trace()
-        lstm_loss = 0
-        latent_loss = 0
-        gp_loss = 0
-        max_ll = 0
-        ae_loss = 0
-        for i in range(1, opt.n_past+opt.n_future):
-            assert x[i-1].shape == (opt.batch_size, opt.channels, opt.patch_size, opt.patch_size)
-            h = encoder(x[i-1])
+        # --------- loss functions ------------------------------------
+        if encoder_enabled:
             h_target = encoder(x[i])[0]
 
-            if opt.last_frame_skip or i < opt.n_past:   
-                h, skip = h
-            else:
-                h = h[0]
-            
-            h_pred = frame_predictor(h)                         # Target encoding using LSTM
-            latent_loss  += latent_loss_func(h_pred,h_target) # LSTM loss - how well LSTM predicts next encoding
-
-            if not encoder_lstm_only:
-                gp_pred = gp_layer(h.transpose(0,1).view(90,opt.batch_size,1))#likelihood(gp_layer(h.transpose(0,1).view(90,opt.batch_size,1)))#
-                max_ll -= mll(gp_pred,h_target.transpose(0,1))      # GP Loss - how well GP predicts next encoding
-            x_pred = decoder([h_pred, skip])                    # Decoded LSTM prediction
-
+        if encoder_enabled and lstm_enabled:
+            latent_loss  += latent_loss_func(h_pred, h_target) # LSTM loss - how well LSTM predicts next encoding
             x_target_pred = decoder([h_target, skip])           # Decoded target encoding
-            ae_loss += reconstruction_loss_func(x_target_pred,x[i])  # Encoder loss - how well the encoder encodes
+            ae_loss += reconstruction_loss_func(x_target_pred, x[i])  # Encoder loss - how well the encoder encodes
+        elif encoder_enabled:
+            decoded = decoder([h_pred, skip])
+            assert x[i-1].shape == decoded.shape
+            ae_loss += reconstruction_loss_func(decoded, x[i-1])
 
-            if not encoder_lstm_only:
-                x_pred_gp = decoder([gp_pred.mean.transpose(0,1), skip])    # Decoded GP prediction
-            lstm_loss += reconstruction_loss_func(x_pred, x[i])                          # Encoder + LSTM loss - how well the encoder+LSTM predicts the next frame
-            if not encoder_lstm_only:
-                gp_loss += reconstruction_loss_func(x_pred_gp, x[i])             # Encoder + GP loss - how well the encoder+GP predicts the next frame
-            torch.cuda.empty_cache()
-
-
-        encoder_weight = 100
-        alpha = 1
-        beta = 0.1
-        loss = encoder_weight*ae_loss + alpha*lstm_loss+ alpha*latent_loss  # + kld*opt.beta
-        if not encoder_lstm_only:
-            loss += beta*gp_loss + beta*max_ll.sum()
-
-        to_log = {
-            f"Train/Encoder {loss_type}": ae_loss,
-            "Train/Encoder and LSTM": lstm_loss,
-            "Train/LSTM": latent_loss,
-            "Train/Total": loss
-        }
+        if lstm_enabled:
+            lstm_loss += reconstruction_loss_func(x_pred, x[i])  # Encoder + LSTM loss - how well the encoder+LSTM predicts the next frame
+            
         
-        if not encoder_lstm_only:
-            to_log["Train/GP"] = gp_loss,
-            to_log["Train/Max LL"] = max_ll.sum()
+        if encoder_enabled and gp_enabled:
+            max_ll -= mll(gp_pred, h_target.transpose(0,1)).sum()      # GP Loss - how well GP predicts next encoding
+            gp_loss += reconstruction_loss_func(x_pred_gp, x[i])             # Encoder + GP loss - how well the encoder+GP predicts the next frame
+        
+        torch.cuda.empty_cache()
 
+    # --------- loss functions ------------------------------------
+    encoder_weight = 100
+    alpha = 1
+    beta = 0.1
+    loss = 0
+    if encoder_enabled:
+        loss += encoder_weight*ae_loss
+    if lstm_enabled:
+        loss += alpha*lstm_loss
+    if encoder_enabled and lstm_enabled:
+        loss += alpha*latent_loss
+    if gp_enabled:
+        loss += beta*gp_loss + beta*max_ll #+ kld*opt.beta
+
+    if train:
         loss.backward()
+        if encoder_enabled:
+            encoder_optimizer.step()
+            decoder_optimizer.step()
+        if lstm_enabled:
+            frame_predictor_optimizer.step()
+        if gp_enabled:
+            optimizer.step()
 
-        frame_predictor_optimizer.step()
-        encoder_optimizer.step()
-        decoder_optimizer.step()
-        optimizer.step()
+    to_log = {"Total": loss}
+    if encoder_enabled:
+        to_log[f"Encoder {loss_type}"] = ae_loss
+    if lstm_enabled:
+        to_log["LSTM"] = lstm_loss
+    if encoder_enabled and lstm_enabled:
+        to_log["Latent LSTM"] = latent_loss
+    if gp_enabled:
+        to_log["GP"] = gp_loss
+        to_log["Latent GP"] = max_ll
 
+    if train:
         return to_log
+
+    assert len(x) == len(gen_seq), f"{len(x)} != {len(gen_seq)}"
+    assert x[0].shape == gen_seq[0].shape
+    return to_log, gen_seq
 
 
 # --------- patching functions ------------------------------------
@@ -383,7 +388,7 @@ def generate_patches(x: List[torch.Tensor]) -> List[List[torch.Tensor]]:
             x_patches.append(x_patch)
     return x_patches
 
-def merge_patches(x_patches: List[List[torch.Tensor]]) -> List[torch.Tensor]:
+def merge_patches(x_patches: List[torch.Tensor]) -> torch.Tensor:
     if len(x_patches) == 1:
         return x_patches[0]
     reconstructed_x = []
@@ -394,93 +399,16 @@ def merge_patches(x_patches: List[List[torch.Tensor]]) -> List[torch.Tensor]:
                 patch_idx = k//opt.patch_size + j//opt.patch_size*(opt.image_width//opt.patch_size)
                 reconstructed_x_timestep[:, :, j:j+opt.patch_size, k:k+opt.patch_size]  = x_patches[patch_idx][i]
         reconstructed_x.append(reconstructed_x_timestep)
-    return reconstructed_x
+    return torch.stack(reconstructed_x)
 
-# --------- predicting functions ------------------------------------
-def predict(x) -> List[torch.Tensor]:
-    frame_predictor.hidden = frame_predictor.init_hidden() # Initialize LSTM hidden state
-    
-    x_patches = generate_patches(x)
-    gen_seq_per_patch = []
-    for x_patch in x_patches:
-        gen_seq = [x_patch[0]]
-        for i in range(1, opt.n_eval):
-
-            # Encode the input time step
-            h = encoder(gen_seq[-1])   
-            if opt.last_frame_skip or i < opt.n_past:   
-                h, skip = h     # Extract encoding and skip-connection?
-            else:
-                h, _ = h        # Extract encoding only
-            h = h.detach()
-
-            # Predict the next time step using the LSTM (needs to be called each time to update the hidden state)
-            h_pred = frame_predictor(h).detach()
-            
-            # Use the GP layer to predict the next time step
-            # Previously i%10 was used for longer sequences
-            if not encoder_lstm_only and i % opt.interval_for_gp_layer == 0: 
-                h_pred_from_gp_layer = likelihood(gp_layer(h.transpose(0,1).view(90,opt.batch_size,1)))
-                h_pred = h_pred_from_gp_layer.rsample().transpose(0,1)
-            
-
-            # Add timestep to generated sequence
-            if i < opt.n_past:
-                gen_seq.append(x_patch[i])
-            else:
-                decoded_h_pred = decoder([h_pred,skip]).detach()
-                gen_seq.append(decoded_h_pred)
-        gen_seq_per_patch.append(torch.stack(gen_seq))
-    return merge_patches(gen_seq_per_patch)
-
-def predict_lstm(x) -> List[torch.Tensor]:
-    frame_predictor.hidden = frame_predictor.init_hidden() # Initialize LSTM hidden state
-    x_patches = generate_patches(x)
-    gen_seq_per_patch = []
-    for x_patch in x_patches:
-        gen_seq = [x_patch[0]]
-        for i in range(1, opt.n_eval):
-            x_pred = frame_predictor(x[i-1]).detach()    
-            # Add timestep to generated sequence
-            if i < opt.n_past:
-                gen_seq.append(x_patch[i])
-            else:
-                gen_seq.append(x_pred)
-        gen_seq_per_patch.append(torch.stack(gen_seq))
-    return merge_patches(gen_seq_per_patch)
-
-def predict_decoding(x) -> List[torch.Tensor]:
-    gen_seq = [x[0]]
-    for i in range(1, opt.n_eval):
-
-        # Encode the input time step
-        h = encoder(x[i-1])   
-        if opt.last_frame_skip or i < opt.n_past:   
-            h, skip = h     # Extract encoding and skip-connection?
-        else:
-            h, _ = h        # Extract encoding only
-        h = h.detach()
-
-        h_target = encoder(x[i])[0].detach()
-        decoded_h_target= decoder([h_target,skip]).detach()
-        gen_seq.append(decoded_h_target)
-
-    return gen_seq
 
 # --------- plotting funtions ------------------------------------
-def plot(x, epoch):
+def plot(x, epoch, gen_seq):
     nsample = 5
     gt_seq = [x[i] for i in range(len(x))]
 
-    if encoder_only:
-        gen_seq = [predict_decoding(x)]
-    elif lstm_only:
-        gen_seq = [predict_lstm(x)]
-    elif encoder_lstm_only:
-        gen_seq = [predict(x)]
-    else:
-        gen_seq = [predict(x) for _ in range(nsample)]
-
+    assert len(gt_seq) == len(gen_seq[0]), f"{len(gt_seq)} != {len(gen_seq[0])}"
+    assert gt_seq[0].shape == gen_seq[0][0].shape, f"{gt_seq[0].shape} != {gen_seq[0][0].shape}"
 
     # -------------- creating the GIFs ---------------------------
     to_plot = []
@@ -491,7 +419,7 @@ def plot(x, epoch):
         row = [gt_seq[t][i] for t in range(opt.n_eval)] 
         to_plot.append(row)
 
-        if encoder_only or encoder_lstm_only:
+        if len(gen_seq) == 1:
             s_list = [0]
         else:
             # Finds best sequence (lowest loss)
@@ -543,7 +471,7 @@ def plot(x, epoch):
     else:
         file_name = f"end2end_gp_ctrl_sample_{epoch}"
 
-    if encoder_only:
+    if encoder_enabled and not lstm_enabled and not gp_enabled:
         file_name += "_autoencoders"
 
     img_path = home_dir / f'imgs/{opt.dataset}/{file_name}.png'
@@ -559,189 +487,159 @@ def plot(x, epoch):
     
 
 # --------- testing loop ------------------------------------
-def compute_metrics(Y_pred: List[np.ndarray], Y_true: List[np.ndarray]) -> np.ndarray:
-    metric_per_timestep = {
-        "mse": [],
-        "mse_per_band": [],
-        "l1": [],
-        "ssim": [],
-    }
-    with torch.no_grad():
-        Y_pred_tensor = torch.tensor(Y_pred)
-        Y_true_tensor = torch.tensor(Y_true)
-        for i in range(len(Y_pred)):
-            y_true = torch.unsqueeze(Y_true_tensor[i], 0)
-            y_pred = torch.unsqueeze(Y_pred_tensor[i], 0)
-            
-            assert y_true.shape == (1, opt.channels, opt.image_width, opt.image_width)
-            assert y_true.shape == y_pred.shape
+def compute_metrics(Y_true: np.ndarray, Y_pred: np.ndarray) -> np.ndarray:
+    metric_for_example = {}
+    metric_for_example["mse"] = ((Y_true - Y_pred)**2).mean()
+    metric_for_example["l1"] = np.abs(Y_true - Y_pred).mean()
+    # Mean over batch, timesteps, width, height
+    metric_for_example["mse_per_band"] = ((Y_true - Y_pred)**2).mean(axis=(0,1,3,4))
 
-            mse_for_timestep = mse(y_true, y_pred).item()
-            metric_per_timestep["mse"].append(mse_for_timestep)
-            assert np.isclose(mse_for_timestep, ((Y_true[i] - Y_pred[i])**2).mean()), f"{mse_for_timestep} and {((Y_true[i] - Y_pred[i])**2).mean()}"
-            mse_for_timestep_per_band = ((Y_true[i] - Y_pred[i])**2).mean(axis=(-1,-2))
-            assert mse_for_timestep_per_band.shape == (opt.channels,)
-            metric_per_timestep["mse_per_band"].append(mse_for_timestep_per_band)
-            
-            l1_for_timestep = l1(y_true, y_pred).item()
-            metric_per_timestep["l1"].append(l1_for_timestep)
-            assert np.isclose(l1_for_timestep, (np.abs(Y_true[i] - Y_pred[i])).mean()), f"{l1_for_timestep} and {np.abs(Y_true[i] - Y_pred[i]).mean()}"
+    if opt.dataset == 'satellite':
+        rgb_index = train_data.rgb_index
+        Y_true_img = np.moveaxis(Y_true[:,:, rgb_index], -3, -1).reshape(-1,opt.image.width,opt.image_width,opt.channels) 
+        Y_pred_img = np.moveaxis(Y_pred[:,:, rgb_index], -3, -1).reshape(-1,opt.image.width,opt.image_width,opt.channels) 
+    else:
+        Y_true_img = Y_true
+        Y_pred_img = Y_pred
+    metric_for_example["ssim2"] = np.array([ssim2(
+        Y_true_img[i],
+        Y_pred_img[i],
+        multichannel=True, 
+        data_range=1, 
+        gaussian_weights=True, 
+        win_size=3, 
+        sigma=1.5, 
+        use_sample_covariance=False) for i in range(Y_true.shape[0])]).mean()
 
-            metric_per_timestep["ssim"].append(ssim(y_true, y_pred).item())
-
-
-    metric_for_example = {metric_type: np.mean(values_per_timestep, axis=0) for metric_type, values_per_timestep in metric_per_timestep.items()}
     return metric_for_example
 
 
-if opt.test:
-    frame_predictor.eval()
-    gp_layer.eval()
-    likelihood.eval()
+def get_metrics_for_example(gt_seq: torch.Tensor, gen_seq: List[List], nsample=1):
+    # Finds best sequence (lowest loss)
+    min_mse = None
+    for s in range(nsample):
 
-    # Go through all test data
-    metrics_for_each_example = []
-
-    for sequence in tqdm(test_loader):
-        x = utils.normalize_data(opt.dataset, dtype, sequence)
-        if encoder_only:
-            nsample = 1
-            gen_seq = [predict_decoding(x)]
-        elif lstm_only:
-            nsample = 1
-            gen_seq = [predict_lstm(x)]
-        elif encoder_lstm_only:
-            nsample = 1
-            gen_seq = [predict(x)]
+        if opt.dataset == "satellite":
+            Y_pred = train_data._unnormalize(gen_seq[s][opt.n_past: opt.n_eval].data.cpu().numpy())
+            Y_true = train_data._unnormalize(gt_seq[opt.n_past: opt.n_eval].data.cpu().numpy())
         else:
-            nsample = 5
-            gen_seq = [predict(x) for _ in range(nsample)]
+            Y_pred = gen_seq[s][opt.n_past: opt.n_eval].data.cpu().numpy()
+            Y_true = gt_seq[opt.n_past: opt.n_eval].data.cpu().numpy()
 
-        gt_seq = [x[i] for i in range(len(x))]
-
-        assert len(gen_seq[0]) == len(gt_seq)
-        assert gen_seq[0][0].shape == gt_seq[0].shape
+        metrics_for_example = compute_metrics(Y_true, Y_pred)
         
-        for i in tqdm(range(opt.batch_size), leave=False):
-            # Finds best sequence (lowest loss)
-            min_mse = None
-            for s in range(nsample):
-                Y_pred = []
-                Y_true = []
+        if min_mse is None or  min_mse > metrics_for_example["mse"]:
+            min_mse = metrics_for_example["mse"]
+            lowest_metrics_for_example = metrics_for_example
 
-                for t in range(opt.n_past, opt.n_eval):
-                    y_pred_timestep = gen_seq[s][t][i].data.cpu().numpy()
-                    y_true_timestep = gt_seq[t][i].data.cpu().numpy()
-                    if opt.dataset == "satellite":
-                        Y_pred.append(train_data._unnormalize(y_pred_timestep))
-                        Y_true.append(train_data._unnormalize(y_true_timestep))
-                    else:
-                        Y_pred.append(y_pred_timestep)
-                        Y_true.append(y_true_timestep)
-
-
-                metrics_for_example = compute_metrics(Y_true, Y_pred)
-                
-                if min_mse is None or  min_mse > metrics_for_example["mse"]:
-                    min_mse = metrics_for_example["mse"]
-                    lowest_metrics_for_example = metrics_for_example
-            
-            metrics_for_each_example.append(lowest_metrics_for_example)
-
-    metrics_for_test_set = {}
-    for metric_type in metrics_for_each_example[0].keys():
-        mean_metric = np.array([m[metric_type] for m in metrics_for_each_example]).mean(axis=0)
-        metrics_for_test_set[metric_type] = mean_metric if type(mean_metric) is not np.ndarray else list(mean_metric)
-    
-
-    for metric_type, metric in metrics_for_test_set.items():
-        print(f"{metric_type}: {metric}")
-
-    # Check if metrics json file exists
-    metrics_json_path = home_dir / "Results/metrics.json"
-    metrics_json_already_exists = metrics_json_path.exists()
-    if not metrics_json_already_exists:
-        metrics_json_path.touch()
-
-    # Read metrics json file
-    with open(metrics_json_path, "r") as f:
-        if metrics_json_already_exists:
-            metrics_json = json.load(f)
-        else:
-            metrics_json = {}
-
-        if opt.dataset not in metrics_json:
-            metrics_json[opt.dataset] = {}
-
-        metrics_json[opt.dataset][opt.model_path] = metrics_for_test_set
-
-    # Write new metrics to metrics json file
-    with open(metrics_json_path, "w") as f:
-        json.dump(metrics_json, f, ensure_ascii=False, indent=4)
-
+    return lowest_metrics_for_example
 
 
 # --------- training loop ------------------------------------
-else:
-    epoch_size = len(train_loader)
-    with gpytorch.settings.max_cg_iterations(45):
-        for epoch in range(opt.niter):
-            gp_layer.train()
-            likelihood.train()
-            frame_predictor.train()
-            encoder.train()
-            decoder.train()
-            scheduler.step()
+with gpytorch.settings.max_cg_iterations(45):
+
+    for epoch in range(opt.niter):
+
+        if not opt.test:
+            if lstm_enabled:
+                frame_predictor.train()
+            if encoder_enabled:
+                encoder.train()
+                decoder.train()
+            if gp_enabled:
+                gp_layer.train()
+                likelihood.train()
+                scheduler.step()
             epoch_loss = 0
-            progress = progressbar.ProgressBar(epoch_size).start()
-            for i in range(epoch_size):
-                progress.update(i+1)
+            for i in tqdm(range(len(train_loader)), leave=False, desc=f"Training epoch: {epoch}"):
                 x = next(training_batch_generator)
                 x_patches = generate_patches(x)
-                #random.shuffle(x_patches)
                 step_loss_dict = defaultdict(lambda: 0)
                 step_loss_dict["Epoch"] = epoch
                 for x_patch in x_patches:
-                    step_patch_loss_dict = train(x_patch, epoch) 
+                    step_patch_loss_dict = run_batch(x_patch, train=True)#train(x_patch, epoch) 
                     for k,v in step_patch_loss_dict.items():
-                        step_loss_dict[k] += v
+                        step_loss_dict[f"train_{k}"] += v
                     
                 wandb.log(step_loss_dict)
 
-            progress.finish()
-            utils.clear_progressbar()
+        if lstm_enabled:
+            frame_predictor.eval()
+        if gp_enabled:
+            gp_layer.eval()
+            likelihood.eval()
+        if encoder_enabled:
+            encoder.eval()
+            decoder.eval()
+        
+        test_size = len(test_loader)
+
+        with torch.no_grad():
+            log_dict = defaultdict(lambda: 0)
+            log_dict["Epoch"] = epoch
+            metrics_for_each_batch = []
+            for sequence in tqdm(test_loader, leave=False, desc=f"Testing epoch {epoch}"):
+                x = utils.normalize_data(opt.dataset, dtype, sequence)
+                x_patches = generate_patches(x)
+                gen_seq_per_patch = []
+                for x_patch in x_patches:
+                    step_patch_loss_dict, gen_seq_for_patch = run_batch(x_patch, train=False)
+                    gen_seq_per_patch.append(torch.stack(gen_seq_for_patch))
+                    for k,v in step_patch_loss_dict.items():
+                        log_dict[f"test_{k}"] += v
+
+                gen_seq = [merge_patches(gen_seq_per_patch)]
+                assert len(gen_seq[0]) == len(x)
+                assert gen_seq[0][0].shape == x[0].shape
+
+                lowest_metrics_per_batch = get_metrics_for_example(sequence, gen_seq, nsample=1)
+                metrics_for_each_batch.append(lowest_metrics_per_batch)
+            
+            for k,v in log_dict.items():
+                if k != "Epoch":
+                    log_dict[k] /= test_size
+
+            if not opt.test:
+                print("--------------------------------------------------------------")
+                print(f"Epoch: {epoch}")
+                print("--------------------------------------------------------------")
+            for metric_type in metrics_for_each_batch[0].keys():
+                mean_metric = np.array([m[metric_type] for m in metrics_for_each_batch]).mean(axis=0)
+                log_dict[metric_type] = mean_metric if type(mean_metric) is not np.ndarray else list(mean_metric)
+                print(f"{metric_type}: {log_dict[metric_type]}")
+
+            if opt.test:
+                break
+            else:
+               wandb.log(log_dict, commit=False) 
             
             if epoch % 4 == 0:
-            
-                # plot some stuff
-                frame_predictor.eval()
-                gp_layer.eval()
-                likelihood.eval()
-
-                test_x = next(testing_batch_generator)
-                tensor_of_images = plot(test_x, epoch)
-                wandb.log({"Test/Images": wandb.Image(tensor_of_images)}, commit=False)
-
+                tensor_of_images = plot(x, epoch, gen_seq=gen_seq)
+                wandb.log({"test_image": wandb.Image(tensor_of_images), "epoch": epoch}, commit=False)
+                
                 # save the model
                 if opt.run_name:
                     model_name = opt.run_name
                 else:
-                    model_name = f'e2e_{opt.dataset}_model'
+                    model_name = f'{opt.components}_{opt.dataset}_model_epoch_{epoch}'
                 
-                if encoder_only:
+                if encoder_enabled and not lstm_enabled and not gp_enabled:
                     model_name += '_autoencoder'
-
                 model_path = home_dir / f'model_dump/{opt.dataset}/{model_name}.pth'
                 model_path.parent.mkdir(parents=True, exist_ok=True)
-                torch.save({
-                    'encoder': encoder,
-                    'decoder': decoder,
-                    'frame_predictor': frame_predictor,
-                    'likelihood': likelihood.state_dict(),
-                    'gp_layer': gp_layer.state_dict(),
-                    'gp_layer_optimizer': optimizer.state_dict(),
-                    'opt': opt},
-                    str(model_path))
 
-            if epoch % 10 == 0:
-                print('log dir: %s' % opt.log_dir)
+                save_dict = {'opt': opt}
+                if encoder_enabled:
+                    save_dict['encoder'] = encoder
+                    save_dict['decoder'] = decoder
+                if lstm_enabled:
+                    save_dict['frame_predictor'] = frame_predictor
+                if gp_enabled:
+                    save_dict['gp_layer'] = gp_layer
+                    save_dict['likelihood'] = likelihood
+
+                torch.save(save_dict, str(model_path))
+                print(f"Saving model: {opt.dataset}/{model_name}.pth'")
+                #artifact.add_file(str(model_path), name=f'{model_name}.pth')
+                #run.log_artifact(artifact)
+
