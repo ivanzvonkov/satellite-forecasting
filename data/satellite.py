@@ -26,7 +26,7 @@ class SatelliteData(object):
     
     """Data Handler that loads satellite data."""
 
-    def __init__(self, data_root, bands_to_keep=RGB_BANDS, train=True, seq_len=12, normalization=Normalization.MINMAX, use_cache=True):
+    def __init__(self, data_root, bands_to_keep=RGB_BANDS, train=True, seq_len=12, normalization=Normalization.MINMAX, use_cache=False):
 
         self.bands_to_keep = bands_to_keep
         self.seq_len = seq_len
