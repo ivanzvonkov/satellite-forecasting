@@ -496,8 +496,8 @@ def compute_metrics(Y_true: np.ndarray, Y_pred: np.ndarray) -> np.ndarray:
 
     if opt.dataset == 'satellite':
         rgb_index = train_data.rgb_index
-        Y_true_img = np.moveaxis(Y_true[:,:, rgb_index], -3, -1).reshape(-1,opt.image.width,opt.image_width,opt.channels) 
-        Y_pred_img = np.moveaxis(Y_pred[:,:, rgb_index], -3, -1).reshape(-1,opt.image.width,opt.image_width,opt.channels) 
+        Y_true_img = np.moveaxis(Y_true[:,:, rgb_index], -3, -1).reshape(-1,opt.image_width,opt.image_width,opt.channels) 
+        Y_pred_img = np.moveaxis(Y_pred[:,:, rgb_index], -3, -1).reshape(-1,opt.image_width,opt.image_width,opt.channels) 
     else:
         Y_true_img = Y_true
         Y_pred_img = Y_pred
@@ -594,6 +594,9 @@ with gpytorch.settings.max_cg_iterations(45):
 
                 lowest_metrics_per_batch = get_metrics_for_example(sequence, gen_seq, nsample=1)
                 metrics_for_each_batch.append(lowest_metrics_per_batch)
+
+                # This is porbably not necessary
+                torch.cuda.empty_cache()
             
             for k,v in log_dict.items():
                 if k != "Epoch":
