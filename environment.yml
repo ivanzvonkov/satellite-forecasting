@@ -18,5 +18,5 @@ dependencies:
     - gpytorch==0.3.0
     - ipython==7.24.1
     - progressbar==2.5
-    - tensorboard==2.5.0
+    - wandb
 

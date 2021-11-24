@@ -5,6 +5,7 @@ import xarray as xr
 
 from pathlib import Path
 from enum import Enum
+from tqdm import tqdm
 from typing import Optional
 from .convert_satellite import BANDS_WITH_NDVI
 
@@ -25,13 +26,11 @@ class SatelliteData(object):
     
     """Data Handler that loads satellite data."""
 
-    def __init__(self, data_root, bands_to_keep=RGB_BANDS, train=True, seq_len=12, normalization=Normalization.MINMAX, no_randomization=False):
+    def __init__(self, data_root, bands_to_keep=RGB_BANDS, train=True, seq_len=12, normalization=Normalization.MINMAX, use_cache=False):
 
         self.bands_to_keep = bands_to_keep
         self.seq_len = seq_len
         self.normalization = normalization
-        self.no_randomization = no_randomization
-
 
         with (Path(data_root) / "normalizing_dict.json").open() as f:
             normalizing_dict = json.load(f)
@@ -56,20 +55,18 @@ class SatelliteData(object):
 
         if train:
             data_root_subset = Path(data_root) / "train" 
-
         else:
             data_root_subset = Path(data_root) / "test" 
 
-        
+        self.rgb_index = np.array([self.bands_to_keep.index(b) for b in RGB_BANDS])
         self.nc_files = [str(i) for i in data_root_subset.glob("*.nc")]
 
         print(f"Using: {len(self.nc_files)} for {'training' if train else 'testing'}")
-        self.seed_is_set = True 
 
-    def set_seed(self, seed):
-        if not self.seed_is_set:
-            self.seed_is_set = True
-            np.random.seed(seed)
+        self.use_cache = use_cache and not train
+        self.x = None
+        if self.use_cache:
+            self.x = torch.stack([self[i] for i in tqdm(range(len(self)), desc="Caching")])
 
 
     @staticmethod
@@ -140,12 +137,11 @@ class SatelliteData(object):
 
 
     def __getitem__(self, index):
-        if not self.no_randomization:
-            self.set_seed(index)
-            rand_i = np.random.randint(len(self.nc_files))
-            file = self.nc_files[rand_i]
-        else:
-            file = self.nc_files[index]
+        if self.x is not None:
+            return self.x[index]
+
+        file = self.nc_files[index]
+
         tile = xr.open_dataarray(file).values
         assert tile.shape == (60, len(BANDS_WITH_NDVI), 64, 64)
 
@@ -160,13 +156,7 @@ class SatelliteData(object):
         return torch.from_numpy(tile)
 
     def get_nc(self, index):
-        if not self.no_randomization:
-            self.set_seed(index)
-            rand_i = np.random.randint(len(self.nc_files))
-            file = self.nc_files[rand_i]
-        else:
-            file = self.nc_files[index]
-        return xr.open_dataarray(file)
+        return xr.open_dataarray(self.nc_files[index])
 
 
     @classmethod
@@ -184,8 +174,7 @@ class SatelliteData(object):
         tile = self._unnormalize(tile)
 
         # Extract reference to Red, Green, Blue in image
-        rgb_index = np.array([self.bands_to_keep.index(b) for b in RGB_BANDS])
-        colors = tile[rgb_index, :, :].astype(np.float64)
+        colors = tile[self.rgb_index].astype(np.float64)
         colors = colors*10000
 
         # Enforce maximum and minimum values
