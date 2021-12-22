@@ -1,38 +1,23 @@
 # Satellite Forecasting
 
-This repository is based on the Diverse Video Generation repo.
-
-The code for that paper is [Diverse Video Generation using a Gaussian Process Trigger](https://openreview.net/forum?id=Qm7R_SdqTpT) by [Gaurav Shrivastava](https://www.cs.umd.edu/~gauravsh/) and [Abhinav Shrivastava](https://www.cs.umd.edu/~abhinav/). 
+This repository is based on the [repository](https://github.com/shgaurav1/DVG) for [Diverse Video Generation using a Gaussian Process Trigger](https://openreview.net/forum?id=Qm7R_SdqTpT) published by [Gaurav Shrivastava](https://www.cs.umd.edu/~gauravsh/) and [Abhinav Shrivastava](https://www.cs.umd.edu/~abhinav/). 
 
 ## Environment
-1. Ensure you have [anaconda](https://www.anaconda.com/download/) installed and run:
-    ```bash
-    conda env create -f environment.yml # Creates environment
-    conda activate dvg                  # Activates environment
-    ```
-2. Install torch following the instructions here [torch.ch/docs/getting-started.html](torch.ch/docs/getting-started.html). This will make it possible to run lua scripts in this repository.
-
-3. Install [ffmpeg](https://ffmpeg.org/), this is needed for converting .avi file into .png files for the data loader.
-
-
-## KTH action dataset
+Ensure you have [anaconda](https://www.anaconda.com/download/) installed and run:
 ```bash
-# Download the dataset
-sh data/download_kth.sh /my/kth/data/path/
-
-# Convert .avi to .png files
-th data/convert_kth.lua --imageSize 64 --dataRoot /my/kth/data/path/
-
-# Create metadata
-python data/meta_creator.py
+conda env create -f environment.yml # Creates environment
+conda activate dvg                  # Activates environment
 ```
+
+## Arizona Dataset
+Dataset (~100GB) is available in the cluster and is available for access if requested.  Please contact hkjoo@cs.umd.edu for permission request.
 
 ## Training the model
-Experimental results in the paper used 64x64.
-To train the DVG model on 64x64 KTH videos run:
+To train the DVG model on 64x64 Arizona datasets, run:
 ```
-python DVG.py 
+python DVG.py --data_root /path/to/Arizona/dataset --dataset satellite --home_dir /save/path/for/generated/outputs
 ```
-<p align="center">
-<img src='Results/QualitativeResults_DVG.gif' align="center" width=630 height="480">
-</p>
+
+If there is a memory error, please lower the batch size by adding the following parameter: --batch_size \<default:50\>
+
+Please update the parameters if you would like to run the model with a different configuration.
